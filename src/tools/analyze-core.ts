@@ -4,7 +4,11 @@ import { getAdapter } from '../adapters/adapter.interface.js';
 import { getDetailConfig, resolveMaxFrames } from '../config/detail-levels.js';
 import type { DetailLevel } from '../config/detail-levels.js';
 import { buildAnnotatedTimeline } from '../processors/annotated-timeline.js';
-import { extractAudioTrack, transcribeAudio } from '../processors/audio-transcriber.js';
+import {
+  encodeAudioMp3,
+  extractAudioTrack,
+  transcribeAudio,
+} from '../processors/audio-transcriber.js';
 import type { TranscribeOptions } from '../processors/audio-transcriber.js';
 import { extractBrowserFrames, generateTimestamps } from '../processors/browser-frame-extractor.js';
 import {
@@ -25,6 +29,7 @@ import {
   optimizeFramesKeepingOriginals,
 } from '../processors/image-optimizer.js';
 import type { FrameOriginals } from '../processors/image-optimizer.js';
+import { buildSlideNarration } from '../processors/slide-sync.js';
 import type { IAnalysisResult, IVideoMetadata } from '../types.js';
 import { readAnalysisSidecar, writeAnalysisSidecars } from '../utils/analysis-sidecar.js';
 import type { ResultDefiningParams } from '../utils/analysis-sidecar.js';
@@ -421,15 +426,6 @@ async function runAnalysisPipeline(
 
         await progress(93, 'Frames deduplicated and OCR complete');
       }
-
-      if (config.includeTimeline) {
-        await progress(95, 'Building annotated timeline...');
-        result.timeline = buildAnnotatedTimeline(
-          result.transcript,
-          result.frames,
-          result.ocrResults,
-        );
-      }
     } else if (result.transcript.length === 0 && adapter.capabilities.videoDownload) {
       // Even without frames, fetch the video so the Whisper fallback can run.
       tempDir = tempDir ?? (await createTempDir());
@@ -442,6 +438,20 @@ async function runAnalysisPipeline(
     if (result.transcript.length === 0 && videoPath && metadata.hasAudio !== false) {
       try {
         const audioPath = await extractAudioTrack(videoPath, tempDir ?? '');
+        // Keep the audio as a first-class artifact: the CLI copies both files
+        // into --out before the temp dir is reclaimed. The MP3 is best-effort —
+        // losing it must never cost us the transcript.
+        result.audio = { wavPath: audioPath };
+        const mp3Path = await encodeAudioMp3(videoPath, tempDir ?? '').catch((e: unknown) => {
+          warnings.push(
+            `MP3 copy of the audio could not be produced: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          );
+          return null;
+        });
+        if (mp3Path) result.audio.mp3Path = mp3Path;
+
         const whisperTranscript = await transcribeAudio(audioPath, params.transcribe, (w) =>
           warnings.push(w),
         );
@@ -463,6 +473,21 @@ async function runAnalysisPipeline(
           ? 'No audio track in this clip — nothing to transcribe.'
           : 'No transcript available for this video.',
       );
+    }
+
+    // Built here, AFTER the Whisper fallback, not alongside frame extraction:
+    // the fallback is what populates `result.transcript` for any source without
+    // native captions, so building earlier produced a timeline whose transcript
+    // rows were silently always empty on exactly those videos.
+    if (config.includeTimeline) {
+      await progress(96, 'Building annotated timeline...');
+      result.timeline = buildAnnotatedTimeline(result.transcript, result.frames, result.ocrResults);
+    }
+
+    // Slide-synchronised narration: what was said while each OCR'd slide was on
+    // screen. Only meaningful once there is slide text to key on.
+    if (result.ocrResults.length > 0) {
+      result.slides = buildSlideNarration(result.transcript, result.ocrResults, metadata.duration);
     }
 
     await progress(100, 'Analysis complete');

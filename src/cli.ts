@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { copyFile, mkdir } from 'node:fs/promises';
+import { copyFile, mkdir, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { ZodError } from 'zod';
 import { registerAllAdapters } from './adapters/register.js';
+import { parseTimeToSeconds } from './processors/annotated-timeline.js';
+import { renderTranscriptText } from './processors/slide-sync.js';
 import {
   AnalyzeOptionsSchema,
   assembleResultDoc,
@@ -12,7 +14,7 @@ import {
   resolveAnalyzeParams,
 } from './tools/analyze-core.js';
 import type { AnalyzeOptions, ProgressReporter } from './tools/analyze-core.js';
-import type { IFrameResult } from './types.js';
+import type { IAnalysisResult, IFrameResult } from './types.js';
 import { persistentCacheDir } from './utils/temp-files.js';
 import { isVideoSource } from './utils/url-detector.js';
 
@@ -154,6 +156,77 @@ function formatError(err: unknown): string {
  * `mcp-video-analyzer analyze` entry point. stdout is reserved for the single
  * JSON result document — everything else (progress, errors) goes to stderr.
  */
+/**
+ * Copy the audio out of the per-call temp dir and write the standalone
+ * transcript artifacts into `outDir`.
+ *
+ * Runs BEFORE `handle.cleanup()` for the same reason frame copying does: the
+ * WAV and MP3 live in the temp dir and are gone the moment it is reclaimed.
+ * Every failure is collected as a warning rather than thrown — a document that
+ * already has a transcript must not be lost because a file copy failed.
+ */
+export async function writeAnalysisArtifacts(
+  result: IAnalysisResult,
+  outDir: string,
+): Promise<{ paths: Record<string, string>; warnings: string[] }> {
+  const paths: Record<string, string> = {};
+  const warnings: string[] = [];
+
+  const hasAudio = Boolean(result.audio?.wavPath ?? result.audio?.mp3Path);
+  const hasTranscript = result.transcript.length > 0;
+  // Create `--out` only when something actually lands in it. A run that emits
+  // no frames and produced no audio or transcript (a `--fields metadata` query,
+  // a silent clip) must leave the filesystem untouched rather than scattering
+  // empty directories — asserted by the CLI smoke test.
+  if (!hasAudio && !hasTranscript) return { paths, warnings };
+
+  await mkdir(outDir, { recursive: true });
+
+  const audioCopies: [string | undefined, string, string][] = [
+    [result.audio?.wavPath, 'audio.wav', 'wav'],
+    [result.audio?.mp3Path, 'audio.mp3', 'mp3'],
+  ];
+  for (const [src, name, key] of audioCopies) {
+    if (!src) continue;
+    const dest = join(outDir, name);
+    try {
+      await copyFile(src, dest);
+      paths[key] = dest;
+    } catch (e: unknown) {
+      warnings.push(`Could not keep ${name}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
+
+  if (result.transcript.length > 0) {
+    const txtPath = join(outDir, 'transcript.txt');
+    const jsonPath = join(outDir, 'transcript.json');
+    const doc = {
+      source: result.metadata.url,
+      durationSeconds: result.metadata.duration,
+      segments: result.transcript.map((t) => ({
+        start: parseTimeToSeconds(t.time),
+        end: t.endTime === undefined ? undefined : parseTimeToSeconds(t.endTime),
+        startTime: t.time,
+        endTime: t.endTime,
+        text: t.text,
+      })),
+      slides: result.slides ?? [],
+    };
+    try {
+      await writeFile(txtPath, `${renderTranscriptText(result.transcript)}\n`, 'utf8');
+      paths.transcriptTxt = txtPath;
+      await writeFile(jsonPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+      paths.transcriptJson = jsonPath;
+    } catch (e: unknown) {
+      warnings.push(
+        `Could not write transcript artifacts: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  return { paths, warnings };
+}
+
 export async function runCli(argv: string[]): Promise<number> {
   let invocation: CliInvocation;
   try {
@@ -199,16 +272,21 @@ export async function runCli(argv: string[]): Promise<number> {
   const fields = invocation.options?.fields;
   const wantFrames = !fields || fields.includes('frames');
 
+  const outDir = invocation.outDir ?? defaultOutDir(url);
   let frames: IFrameResult[] = [];
   let missing = 0;
+  let artifacts: Record<string, string> = {};
   const copyWarnings: string[] = [];
   try {
     if (wantFrames && result.frames.length > 0) {
-      const copied = await copyFrames(result.frames, invocation.outDir ?? defaultOutDir(url));
+      const copied = await copyFrames(result.frames, outDir);
       frames = copied.frames;
       missing = copied.missing;
       copyWarnings.push(...copied.errors);
     }
+    const written = await writeAnalysisArtifacts(result, outDir);
+    artifacts = written.paths;
+    copyWarnings.push(...written.warnings);
   } catch (err) {
     // A failed mkdir/copy (bad --out, permissions) must not discard an
     // analysis that already succeeded — degrade into warnings[] and emit the
@@ -227,6 +305,9 @@ export async function runCli(argv: string[]): Promise<number> {
     extraWarnings: copyWarnings,
   });
   if (wantFrames) doc.frames = frames;
+  // Where the kept audio and the standalone transcript files ended up, so a
+  // caller parsing stdout never has to guess at --out's layout.
+  if (Object.keys(artifacts).length > 0) doc.artifacts = artifacts;
 
   process.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
   return 0;
