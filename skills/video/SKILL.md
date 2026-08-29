@@ -29,13 +29,13 @@ Run the one-shot CLI via Bash (first run downloads the npm package — slow is n
 npx -y mcp-video-analyzer@latest analyze "<video-url-or-path>"
 ```
 
-stdout is a single JSON document: `metadata`, `transcript` (timestamped entries), `ocrResults` (on-screen text), `timeline`, `slides`, `warnings`, `artifacts`, and `frames` — an array of `{ time, filePath, mimeType }` pointing to JPEG key frames on disk. `slides` pairs each OCR'd slide with the narration spoken while it was on screen — use it for slide decks and lecture recordings instead of correlating `transcript` and `ocrResults` by hand. `artifacts` names the extra files written into `--out`: `audio.wav` (16kHz mono 16-bit), `audio.mp3`, `transcript.txt`, and a timestamped `transcript.json`. Then:
+stdout is a single JSON document: `metadata`, `transcript` (timestamped entries), `ocrResults` (on-screen text), `timeline`, `slides`, `warnings`, `artifacts`, and `frames` — an array of `{ time, filePath, mimeType }` pointing to JPEG key frames on disk. `slides` pairs each OCR'd slide with the narration spoken while it was on screen — use it for slide decks and lecture recordings instead of correlating `transcript` and `ocrResults` by hand. `artifacts` names everything written into `--out`: `extracted_audio.wav` (16kHz mono 16-bit), `extracted_audio.mp3`, `transcript.txt`, a timestamped `transcript.json`, `slides/` (frame JPEGs as `slide-NN.jpg` + `slides.json`), and the final synchronized timeline as `timeline.json` plus a readable `timeline.md`. Then:
 
 1. Parse the JSON from stdout.
 2. Read the `frames[].filePath` images (in parallel) when the question needs visuals.
 3. Answer from transcript + OCR + frames, citing timestamps.
 
-Useful flags: `--detail brief|standard|detailed` (brief = metadata + transcript only, no frame extraction — the fast/cheap path), `--fields metadata,transcript` (filters the emitted JSON only — `slides` is also selectable; frames are still computed at standard detail), `--max-frames <1-60>`, `--max-width <px>` (frame width cap, default 800; `0` keeps source resolution — use it for dense UI captures whose payload is small text), `--language <code>` (force transcription language), `--out <dir>` (where frames are copied), `--force-refresh`. Run `npx -y mcp-video-analyzer@latest analyze --help` for the full list.
+Useful flags: `--detail brief|standard|detailed` (brief = metadata + transcript only, no frame extraction — the fast/cheap path), `--fields metadata,transcript` (filters the emitted JSON only — `slides` is also selectable; frames are still computed at standard detail), `--max-frames <1-60>`, `--max-width <px>` (frame width cap, default 800; `0` keeps source resolution — use it for dense UI captures whose payload is small text), `--language <code>` (force transcription language), `--out <dir>` (artifact dir: `slides/`, audio, transcript, timeline), `--force-refresh`. Run `npx -y mcp-video-analyzer@latest analyze --help` for the full list.
 
 ## Prerequisites & degradation
 

@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { copyFile, mkdir, writeFile } from 'node:fs/promises';
-import { basename, isAbsolute, join, resolve } from 'node:path';
+import { extname, isAbsolute, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { ZodError } from 'zod';
 import { registerAllAdapters } from './adapters/register.js';
@@ -14,9 +14,12 @@ import {
   resolveAnalyzeParams,
 } from './tools/analyze-core.js';
 import type { AnalyzeOptions, ProgressReporter } from './tools/analyze-core.js';
-import type { IAnalysisResult, IFrameResult } from './types.js';
+import type { IAnalysisResult, IFrameResult, ISlideNarration } from './types.js';
 import { persistentCacheDir } from './utils/temp-files.js';
 import { isVideoSource } from './utils/url-detector.js';
+
+/** Subdirectory of `--out` holding the slide images and slides.json. */
+const SLIDES_DIRNAME = 'slides';
 
 const CLI_USAGE = `Usage: mcp-video-analyzer analyze <url-or-path> [options]
 
@@ -109,8 +112,8 @@ export function defaultOutDir(url: string): string {
 
 /**
  * Copy frame images out of the per-call temp dir (about to be cleaned up) into
- * `outDir`, rewriting each `filePath`. Keeps the temp basenames — never derive
- * names from `time` values, which contain `:` (illegal on Windows).
+ * `outDir`, rewriting each `filePath`. Renamed to `slide-NN.<ext>` by ordinal —
+ * never derived from `time` values, which contain `:` (illegal on Windows).
  *
  * ENOENT on the source (frame already cleaned up after a cache hit) is the
  * benign case, counted in `missing`. Any other failure (EACCES/ENOSPC/EROFS on
@@ -125,8 +128,15 @@ export async function copyFrames(
   const copied: IFrameResult[] = [];
   let missing = 0;
   const errors: string[] = [];
-  for (const frame of frames) {
-    const dest = join(outDir, basename(frame.filePath));
+  for (const [i, frame] of frames.entries()) {
+    // Named by slide ordinal rather than the temp basename, so `slides/` reads
+    // as a deck. Still never derived from `time` — those contain `:`, which is
+    // illegal in a Windows filename; a zero-padded index is safe everywhere and
+    // keeps the directory in playback order under a plain lexical sort.
+    const dest = join(
+      outDir,
+      `slide-${String(i + 1).padStart(2, '0')}${extname(frame.filePath) || '.jpg'}`,
+    );
     try {
       await copyFile(frame.filePath, dest);
       copied.push({ ...frame, filePath: dest });
@@ -168,23 +178,27 @@ function formatError(err: unknown): string {
 export async function writeAnalysisArtifacts(
   result: IAnalysisResult,
   outDir: string,
+  slideFrames: IFrameResult[] = [],
 ): Promise<{ paths: Record<string, string>; warnings: string[] }> {
   const paths: Record<string, string> = {};
   const warnings: string[] = [];
 
   const hasAudio = Boolean(result.audio?.wavPath ?? result.audio?.mp3Path);
   const hasTranscript = result.transcript.length > 0;
+  const slides = result.slides ?? [];
   // Create `--out` only when something actually lands in it. A run that emits
-  // no frames and produced no audio or transcript (a `--fields metadata` query,
-  // a silent clip) must leave the filesystem untouched rather than scattering
-  // empty directories — asserted by the CLI smoke test.
-  if (!hasAudio && !hasTranscript) return { paths, warnings };
+  // no frames and produced no audio, transcript or slides (a `--fields metadata`
+  // query, a silent black clip) must leave the filesystem untouched rather than
+  // scattering empty directories — asserted by the CLI smoke test.
+  if (!hasAudio && !hasTranscript && slides.length === 0) return { paths, warnings };
 
   await mkdir(outDir, { recursive: true });
 
+  // `extracted_audio.*` rather than `audio.*`: the name says where it came from,
+  // which matters in an --out dir that also holds slides and transcripts.
   const audioCopies: [string | undefined, string, string][] = [
-    [result.audio?.wavPath, 'audio.wav', 'wav'],
-    [result.audio?.mp3Path, 'audio.mp3', 'mp3'],
+    [result.audio?.wavPath, 'extracted_audio.wav', 'wav'],
+    [result.audio?.mp3Path, 'extracted_audio.mp3', 'mp3'],
   ];
   for (const [src, name, key] of audioCopies) {
     if (!src) continue;
@@ -197,9 +211,15 @@ export async function writeAnalysisArtifacts(
     }
   }
 
-  if (result.transcript.length > 0) {
-    const txtPath = join(outDir, 'transcript.txt');
-    const jsonPath = join(outDir, 'transcript.json');
+  // Frame images were copied into `slides/` by copyFrames; pair each slide with
+  // its image by timestamp so every artifact can point at the picture.
+  const frameByTime = new Map(slideFrames.map((f) => [f.time, f.filePath]));
+  const enrichedSlides = slides.map((slide) => ({
+    ...slide,
+    framePath: frameByTime.get(slide.time),
+  }));
+
+  if (hasTranscript) {
     const doc = {
       source: result.metadata.url,
       durationSeconds: result.metadata.duration,
@@ -210,11 +230,12 @@ export async function writeAnalysisArtifacts(
         endTime: t.endTime,
         text: t.text,
       })),
-      slides: result.slides ?? [],
     };
     try {
+      const txtPath = join(outDir, 'transcript.txt');
       await writeFile(txtPath, `${renderTranscriptText(result.transcript)}\n`, 'utf8');
       paths.transcriptTxt = txtPath;
+      const jsonPath = join(outDir, 'transcript.json');
       await writeFile(jsonPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
       paths.transcriptJson = jsonPath;
     } catch (e: unknown) {
@@ -224,7 +245,102 @@ export async function writeAnalysisArtifacts(
     }
   }
 
+  if (enrichedSlides.length > 0) {
+    const slidesDir = join(outDir, SLIDES_DIRNAME);
+    try {
+      await mkdir(slidesDir, { recursive: true });
+      const slidesJson = join(slidesDir, 'slides.json');
+      await writeFile(
+        slidesJson,
+        `${JSON.stringify(
+          {
+            source: result.metadata.url,
+            durationSeconds: result.metadata.duration,
+            slides: enrichedSlides,
+          },
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      );
+      paths.slidesDir = slidesDir;
+      paths.slidesJson = slidesJson;
+    } catch (e: unknown) {
+      warnings.push(
+        `Could not write slides artifacts: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  // The final synchronized timeline, in both machine and human form: `slides`
+  // is the slide-windowed view (what was said about each slide) and `events` is
+  // the raw chronological merge of transcript, frame and OCR rows.
+  if (enrichedSlides.length > 0 || result.timeline.length > 0) {
+    try {
+      const timelineJson = join(outDir, 'timeline.json');
+      await writeFile(
+        timelineJson,
+        `${JSON.stringify(
+          {
+            source: result.metadata.url,
+            durationSeconds: result.metadata.duration,
+            slides: enrichedSlides,
+            events: result.timeline,
+          },
+          null,
+          2,
+        )}\n`,
+        'utf8',
+      );
+      paths.timelineJson = timelineJson;
+
+      const timelineMd = join(outDir, 'timeline.md');
+      await writeFile(timelineMd, renderTimelineMarkdown(result, enrichedSlides), 'utf8');
+      paths.timelineMd = timelineMd;
+    } catch (e: unknown) {
+      warnings.push(
+        `Could not write the synchronized timeline: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   return { paths, warnings };
+}
+
+/** Human-readable synchronized timeline: one section per slide, narration under it. */
+function renderTimelineMarkdown(
+  result: IAnalysisResult,
+  slides: (ISlideNarration & { framePath?: string })[],
+): string {
+  const title = result.metadata.title || result.metadata.url;
+  const spoken = slides.reduce((n, s) => n + s.transcriptEntries, 0);
+
+  const lines: string[] = [
+    `# ${title} — synchronized timeline`,
+    '',
+    `- Duration: ${result.metadata.durationFormatted ?? `${result.metadata.duration ?? 0}s`}`,
+    `- Slides: ${slides.length}`,
+    `- Transcript segments: ${result.transcript.length} (${spoken} placed on a slide)`,
+    '',
+  ];
+
+  if (result.transcript.length === 0) {
+    lines.push(
+      '> No transcript was produced, so the narration sections below are empty.',
+      '> The slide text comes from OCR and is unaffected.',
+      '',
+    );
+  }
+
+  for (const slide of slides) {
+    lines.push(`## [${slide.time} – ${slide.endTime}] Slide ${slide.slideIndex + 1}`);
+    lines.push('');
+    if (slide.framePath) lines.push(`![slide ${slide.slideIndex + 1}](${slide.framePath})`, '');
+    lines.push('**On screen**', '', '```', slide.ocrText.trim(), '```', '');
+    lines.push('**Narration**', '', slide.narration.trim() || '_(none captured)_', '');
+  }
+
+  return `${lines.join('\n')}\n`;
 }
 
 export async function runCli(argv: string[]): Promise<number> {
@@ -279,12 +395,12 @@ export async function runCli(argv: string[]): Promise<number> {
   const copyWarnings: string[] = [];
   try {
     if (wantFrames && result.frames.length > 0) {
-      const copied = await copyFrames(result.frames, outDir);
+      const copied = await copyFrames(result.frames, join(outDir, SLIDES_DIRNAME));
       frames = copied.frames;
       missing = copied.missing;
       copyWarnings.push(...copied.errors);
     }
-    const written = await writeAnalysisArtifacts(result, outDir);
+    const written = await writeAnalysisArtifacts(result, outDir, frames);
     artifacts = written.paths;
     copyWarnings.push(...written.warnings);
   } catch (err) {
