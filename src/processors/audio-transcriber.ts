@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { ITranscriptEntry } from '../types.js';
 import { envFlag } from '../utils/env.js';
 import { formatTimestamp } from './frame-extractor.js';
+import { WHISPER_CPP_MISSING, transcribeWithWhisperCpp } from './whisper-cpp.js';
 
 const execFile = promisify(execFileCb);
 
@@ -40,6 +41,31 @@ export async function extractAudioTrack(videoPath: string, outputDir: string): P
   } catch (error: unknown) {
     const msg = error instanceof Error ? error.message : String(error);
     throw new Error(`Audio extraction failed: ${msg}`, { cause: error });
+  }
+
+  return outputPath;
+}
+
+/**
+ * Encode a listenable MP3 of the source audio next to the WAV.
+ *
+ * Deliberately transcoded from the ORIGINAL video stream rather than from the
+ * 16kHz mono WAV: that WAV is a recognition input, downmixed and band-limited
+ * for whisper, and re-encoding it to MP3 would preserve those losses in the one
+ * artifact a human actually listens to.
+ */
+export async function encodeAudioMp3(videoPath: string, outputDir: string): Promise<string> {
+  const outputPath = join(outputDir, 'audio.mp3');
+
+  try {
+    await execFile(
+      ffmpegPath,
+      ['-i', videoPath, '-vn', '-acodec', 'libmp3lame', '-q:a', '4', outputPath, '-y'],
+      { timeout: 300000 },
+    );
+  } catch (error: unknown) {
+    const msg = error instanceof Error ? error.message : String(error);
+    throw new Error(`MP3 encode failed: ${msg}`, { cause: error });
   }
 
   return outputPath;
@@ -99,6 +125,9 @@ async function detectMeanVolume(audioPath: string): Promise<number | null> {
  * skips every strategy with a warning, so no Whisper time is burned producing [].
  *
  * Strategy chain (graceful fallback):
+ * 0. whisper.cpp — the preferred backend, and the only fully-local one: a
+ *    compiled binary plus cached ggml weights, no API key, no cloud round-trip,
+ *    and nothing leaves the machine. Skipped only when no binary is installed.
  * 1. @huggingface/transformers — **opt-in only**: runs solely when
  *    WHISPER_HF_MODEL is set (otherwise it would silently transcribe with an
  *    English `tiny` model, ignoring WHISPER_MODEL/WHISPER_LANGUAGE).
@@ -121,6 +150,22 @@ export async function transcribeAudio(
     return [];
   }
 
+  // Strategy 0: whisper.cpp — local, free, and preferred over every backend
+  // below it (those either need an API key or download weights at import time).
+  const cpp = await transcribeWithWhisperCppStrategy(audioPath, opts, onWarning);
+  if (cpp.status === 'ok') {
+    if (cpp.entries.length === 0) {
+      // The silence gate above already cleared this track, so an empty result
+      // here is a broken setup (a stub/truncated ggml file loads and decodes
+      // to nothing), not "no speech". Say so instead of returning a bare [].
+      onWarning?.(
+        'whisper.cpp ran but produced no speech segments on a non-silent track — ' +
+          'the ggml model file is most likely a stub or truncated download.',
+      );
+    }
+    return cpp.entries;
+  }
+
   // Strategy 1: @huggingface/transformers (JS-native whisper) — opt-in
   const hfResult = await transcribeWithHuggingFace(audioPath, opts);
   if (hfResult) return hfResult;
@@ -137,15 +182,49 @@ export async function transcribeAudio(
   // common cause of a mysteriously empty transcript), say how to enable one
   // instead of returning a bare [] the caller reports as "no transcript".
   if (
+    cpp.status === 'not-installed' &&
     !process.env.WHISPER_HF_MODEL &&
     cli.status === 'not-installed' &&
     !process.env.OPENAI_API_KEY
   ) {
     onWarning?.(
-      'No speech-to-text backend available. Install the Whisper CLI (pip install -U openai-whisper), set OPENAI_API_KEY, or set WHISPER_HF_MODEL to transcribe audio.',
+      'No speech-to-text backend available. Build whisper.cpp ' +
+        '(https://github.com/ggml-org/whisper.cpp) and point WHISPER_CPP_BIN at its ' +
+        'whisper-cli, install the Whisper CLI (pip install -U openai-whisper), or set ' +
+        'WHISPER_HF_MODEL to transcribe audio.',
     );
   }
   return [];
+}
+
+/**
+ * Outcome of the whisper.cpp strategy. `not-installed` (no binary found) is
+ * distinct from `failed` (binary ran but the model or the run was bad) so the
+ * "no backend at all" hint only fires when nothing is installed anywhere.
+ */
+type WhisperCppOutcome =
+  | { status: 'ok'; entries: ITranscriptEntry[] }
+  | { status: 'not-installed' }
+  | { status: 'failed' };
+
+async function transcribeWithWhisperCppStrategy(
+  audioPath: string,
+  opts: TranscribeOptions,
+  onWarning?: (message: string) => void,
+): Promise<WhisperCppOutcome> {
+  try {
+    const entries = await transcribeWithWhisperCpp(audioPath, dirname(audioPath), opts, (m) => {
+      // Model downloads and long transcodes are progress, not warnings — and
+      // stdout belongs to the CLI's JSON document, so they go to stderr.
+      process.stderr.write(`[whisper.cpp] ${m}\n`);
+    });
+    return { status: 'ok', entries };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg === WHISPER_CPP_MISSING) return { status: 'not-installed' };
+    onWarning?.(`whisper.cpp transcription failed: ${msg}`);
+    return { status: 'failed' };
+  }
 }
 
 async function transcribeWithHuggingFace(

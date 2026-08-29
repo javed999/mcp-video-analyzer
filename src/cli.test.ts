@@ -152,8 +152,9 @@ describe('copyFrames', () => {
 
     const framePath = await createTestImage(srcDir, 'frame_0001.jpg');
     // A directory occupying the destination path forces a non-ENOENT failure
-    // (EPERM/EISDIR depending on platform).
-    await mkdir(join(outDir, 'frame_0001.jpg'));
+    // (EPERM/EISDIR depending on platform). The destination is named by slide
+    // ordinal, not by the source basename.
+    await mkdir(join(outDir, 'slide-01.jpg'));
 
     const { frames, missing, errors } = await copyFrames(
       [{ time: '0:00', filePath: framePath, mimeType: 'image/jpeg' }],

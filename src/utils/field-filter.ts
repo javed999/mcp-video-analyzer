@@ -8,6 +8,7 @@ export type AnalysisField =
   | 'chapters'
   | 'ocrResults'
   | 'timeline'
+  | 'slides'
   | 'aiSummary';
 
 const ALL_FIELDS: AnalysisField[] = [
@@ -18,6 +19,7 @@ const ALL_FIELDS: AnalysisField[] = [
   'chapters',
   'ocrResults',
   'timeline',
+  'slides',
   'aiSummary',
 ];
 

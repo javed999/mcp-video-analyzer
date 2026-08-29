@@ -119,7 +119,7 @@ stdout is a single JSON document — `metadata`, `transcript`, `ocrResults`, `ti
 | `--detail <level>` | `brief` (metadata + transcript, no frames), `standard` (default), `detailed` |
 | `--max-frames <n>` | Max key frames, 1–60 (default adapts to duration) |
 | `--max-width <px>` | Width cap for emitted frames (default `800`, or `MCP_FRAME_MAX_WIDTH`); `0` keeps the source resolution — see [Frame size](#frame-size-dense-ui-captures) |
-| `--fields <list>` | Output filter — comma-separated subset: `metadata,transcript,frames,comments,chapters,ocrResults,timeline,aiSummary`. Filters the emitted JSON only; use `--detail brief` to actually skip download/frame extraction |
+| `--fields <list>` | Output filter — comma-separated subset: `metadata,transcript,frames,comments,chapters,ocrResults,timeline,slides,aiSummary`. Filters the emitted JSON only; use `--detail brief` to actually skip download/frame extraction |
 | `--force-refresh` | Bypass the cache and re-analyze |
 | `--ocr-language <codes>` | Tesseract languages (default `eng+por`) |
 | `--model <name>` / `--language <code>` | Whisper overrides for the transcription fallback |
@@ -176,7 +176,7 @@ The AI will **automatically** call this tool when it sees a video URL — no nee
 
 Options:
 - `detail` — analysis depth: `"brief"` (metadata + truncated transcript, no frames), `"standard"` (default), `"detailed"` (dense sampling, more frames)
-- `fields` — array of specific fields to return, e.g. `["metadata", "transcript"]`. Available: `metadata`, `transcript`, `frames`, `comments`, `chapters`, `ocrResults`, `timeline`, `aiSummary`
+- `fields` — array of specific fields to return, e.g. `["metadata", "transcript"]`. Available: `metadata`, `transcript`, `frames`, `comments`, `chapters`, `ocrResults`, `timeline`, `slides`, `aiSummary`
 - `maxFrames` (1-60) — cap on extracted frames. Default scales with video duration at `standard` detail (~12 for ≤30s up to 60 for >10min); fixed 60 at `detailed`, 0 at `brief`. An explicit value always wins
 - `threshold` (0.0-1.0, default 0.1) — scene-change sensitivity
 - `forceRefresh` — bypass cache and re-analyze
@@ -353,14 +353,22 @@ When a source has no native transcript (no sidecar `.vtt`/`.srt`, no embedded su
 
 > **Silent tracks**: before any Whisper run, the audio is probed with ffmpeg `volumedetect` (first 2 minutes). A present-but-mute track — common in muted Reels/Stories — skips transcription entirely and emits a warning that the empty transcript is **expected content, not an error**, saving a pointless Whisper run.
 
-1. **@huggingface/transformers** (JS-native, zero external deps) — **opt-in only**: this strategy runs *first*, but **only when `WHISPER_HF_MODEL` is explicitly set**. When it's unset (the default) the strategy is skipped entirely, so the CLI below wins and its `WHISPER_MODEL`/`WHISPER_LANGUAGE` settings are never silently overridden.
-2. **`whisper` CLI** — used when a `whisper` executable is found (`pip install -U openai-whisper`). Point `WHISPER_BIN` at the executable if it isn't on `PATH`. Model via `WHISPER_MODEL`, language via `WHISPER_LANGUAGE`. The bundled `ffmpeg-static` is put on the CLI's `PATH` automatically, so no system ffmpeg is required.
-3. **OpenAI Whisper API** — used when `OPENAI_API_KEY` is set.
+1. **whisper.cpp** — the default and preferred backend, and the only fully local one: a compiled [whisper.cpp](https://github.com/ggml-org/whisper.cpp) binary plus cached ggml weights. No API key, no cloud round-trip, nothing leaves the machine. Point `WHISPER_CPP_BIN` at its `whisper-cli` (or `WHISPER_CPP_DIR` at the build tree); the model (`small.en` by default, `base.en` for a lighter download) is fetched once into `<tmp>/mcp-video-analyzer/whisper-cpp/` and reused. Air-gapped or behind a policy that blocks the model host? Pre-place the file and set `WHISPER_CPP_MODEL_PATH`, or point `WHISPER_CPP_MODEL_URL` at your own mirror.
+2. **@huggingface/transformers** (JS-native, zero external deps) — **opt-in only**: this strategy runs *first*, but **only when `WHISPER_HF_MODEL` is explicitly set**. When it's unset (the default) the strategy is skipped entirely, so the CLI below wins and its `WHISPER_MODEL`/`WHISPER_LANGUAGE` settings are never silently overridden.
+3. **`whisper` CLI** — used when a `whisper` executable is found (`pip install -U openai-whisper`). Point `WHISPER_BIN` at the executable if it isn't on `PATH`. Model via `WHISPER_MODEL`, language via `WHISPER_LANGUAGE`. The bundled `ffmpeg-static` is put on the CLI's `PATH` automatically, so no system ffmpeg is required.
+4. **OpenAI Whisper API** — used when `OPENAI_API_KEY` is set.
 
-> **No backend configured?** If none of the three is available (no `whisper` on `PATH`/`WHISPER_BIN`, no `OPENAI_API_KEY`, no `WHISPER_HF_MODEL`), transcription tools return an empty transcript **with a warning telling you how to enable one** — rather than a silent "no transcript". Install `openai-whisper` or set one of the keys above. (The CLI is spawned with `PYTHONUTF8=1` so non-English/CJK transcripts don't crash the Python process on Windows.)
+> **No backend configured?** If none is available (no whisper.cpp via `WHISPER_CPP_BIN`/`PATH`, no `whisper` on `PATH`/`WHISPER_BIN`, no `OPENAI_API_KEY`, no `WHISPER_HF_MODEL`), transcription tools return an empty transcript **with a warning telling you how to enable one** — rather than a silent "no transcript". Install `openai-whisper` or set one of the keys above. (The CLI is spawned with `PYTHONUTF8=1` so non-English/CJK transcripts don't crash the Python process on Windows.)
 
 | Env var | Applies to | Default | Example |
 |---------|-----------|---------|---------|
+| `WHISPER_CPP_BIN` | whisper.cpp | `whisper-cli` (on PATH) | `/opt/whisper.cpp/build/bin/whisper-cli` |
+| `WHISPER_CPP_DIR` | whisper.cpp | — | `/opt/whisper.cpp` (its `build/bin/whisper-cli` is used) |
+| `WHISPER_CPP_MODEL` | whisper.cpp | `small.en` | `base.en`, `medium.en` |
+| `WHISPER_CPP_MODEL_PATH` | whisper.cpp | — (auto-download) | `/models/ggml-small.en.bin` |
+| `WHISPER_CPP_MODEL_URL` | whisper.cpp | official ggml host | `https://mirror.internal/ggml-{model}.bin` |
+| `WHISPER_CPP_LANGUAGE` | whisper.cpp | `en` | `pt`, `es` |
+| `WHISPER_CPP_THREADS` | whisper.cpp | ffmpeg/CPU default | `8` |
 | `WHISPER_MODEL` | `whisper` CLI | `tiny` | `small`, `medium` |
 | `WHISPER_LANGUAGE` | `whisper` CLI / OpenAI API | auto-detect | `pt`, `en`, `es` |
 | `WHISPER_PROMPT` | `whisper` CLI / OpenAI API | — | `Doha, Smiles, Livelo, Latam, milheiro` |

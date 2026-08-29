@@ -67,6 +67,32 @@ export interface ITimelineEntry {
   ocrText?: string;
 }
 
+/**
+ * One slide (an OCR'd frame) plus the narration spoken while it was on screen.
+ * `narration` is the transcript text falling inside `[seconds, endSeconds)`.
+ */
+export interface ISlideNarration {
+  slideIndex: number;
+  time: string;
+  seconds: number;
+  endTime: string;
+  endSeconds: number;
+  ocrText: string;
+  narration: string;
+  transcriptEntries: number;
+}
+
+/**
+ * Audio extracted from the source video, kept rather than discarded with the
+ * temp dir: the 16kHz mono 16-bit WAV whisper.cpp consumed, and a compressed
+ * MP3 for listening back. Paths are inside the per-call temp dir until the CLI
+ * copies them into `--out`.
+ */
+export interface IAudioArtifacts {
+  wavPath: string;
+  mp3Path?: string;
+}
+
 export interface IAnalysisResult {
   metadata: IVideoMetadata;
   transcript: ITranscriptEntry[];
@@ -75,6 +101,8 @@ export interface IAnalysisResult {
   chapters: IChapter[];
   ocrResults: IOcrEntry[];
   timeline: ITimelineEntry[];
+  slides?: ISlideNarration[];
+  audio?: IAudioArtifacts;
   aiSummary?: string;
   warnings: string[];
 }
