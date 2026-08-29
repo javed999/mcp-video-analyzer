@@ -54,7 +54,7 @@ export async function ocrFrames(
   // fallback to cwd — the very bug this cachePath exists to fix).
   const cachePath = persistentCacheDir('tessdata');
   await mkdir(cachePath, { recursive: true });
-  const worker = await Tesseract.createWorker(language, undefined, { cachePath });
+  const worker = await createWorkerOrThrow(Tesseract, language, cachePath);
 
   try {
     const results: IOcrResult[] = [];
@@ -110,6 +110,71 @@ export async function extractTextFromFrames(
 ): Promise<IOcrResult[]> {
   const all = await ocrFrames(frames, language, onProgress);
   return all.filter(isMeaningfulOcr);
+}
+
+/**
+ * `Tesseract.createWorker` with worker-side failures turned into an ordinary
+ * rejection — the whole reason this wrapper exists.
+ *
+ * tesseract.js reports a worker-side failure (most commonly a `.traineddata`
+ * fetch that 403s behind a proxy, or any offline/air-gapped run) twice: once by
+ * rejecting the pending action promise, and once out-of-band. The out-of-band
+ * half is the dangerous one — with no `errorHandler` option it does a bare
+ * `throw` inside the worker's `message` listener, which Node re-raises via
+ * `process.nextTick` as an UNCAUGHT EXCEPTION. No `try`/`catch` or `.catch()`
+ * at any call site can intercept that, so it killed the entire process and
+ * discarded every partial result already in hand (metadata, transcript, frames)
+ * — exactly the graceful degradation the callers' "OCR failed:" warning is
+ * supposed to provide.
+ *
+ * Passing `errorHandler` suppresses the throw, but on its own it would trade a
+ * crash for a hang: tesseract.js only rejects the `createWorker` promise when
+ * the failing action is `load`, so a `loadLanguage` failure (the traineddata
+ * case) leaves it pending forever. So we race the handler against creation and
+ * reject ourselves, and the rejection lands in the callers' existing catch.
+ */
+async function createWorkerOrThrow(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  Tesseract: any,
+  language: string,
+  cachePath: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): Promise<any> {
+  let signalFailure: (e: Error) => void = () => undefined;
+  const failed = new Promise<never>((_, reject) => {
+    signalFailure = reject;
+  });
+  // Errors keep arriving through `errorHandler` after creation succeeds (a
+  // per-frame `recognize` failure reports on the same channel, and is already
+  // handled by that call's own rejection). Attaching a handler up front keeps
+  // such a late signal from surfacing as an unhandled rejection once nothing is
+  // racing this promise any more.
+  void failed.catch(() => undefined);
+
+  const creation = Tesseract.createWorker(language, undefined, {
+    cachePath,
+    errorHandler: (e: unknown) => signalFailure(e instanceof Error ? e : new Error(String(e))),
+  });
+
+  // If creation completes after we've already given up on it, terminate the
+  // worker rather than leaving the thread running. This can't cover the
+  // `loadLanguage` failure itself — there the promise never settles, so the
+  // handle needed to terminate is never handed over and the orphaned
+  // MessagePort keeps the event loop alive; that residue is why `index.ts`
+  // exits the one-shot CLI explicitly instead of waiting for a natural drain.
+  let raceSettled = false;
+  void creation
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    .then((w: any) => {
+      if (raceSettled) void w?.terminate?.();
+    })
+    .catch(() => undefined);
+
+  try {
+    return await Promise.race([creation, failed]);
+  } finally {
+    raceSettled = true;
+  }
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
