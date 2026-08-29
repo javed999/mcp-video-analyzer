@@ -1,7 +1,7 @@
 import { execFile as execFileCb } from 'node:child_process';
 import { createWriteStream } from 'node:fs';
 import { mkdir, rename, rm, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { promisify } from 'node:util';
@@ -294,7 +294,10 @@ export async function transcribeWithWhisperCpp(
 
   const outputBase = join(outputDir, 'whisper-cpp');
   const jsonPath = `${outputBase}.json`;
-  onProgress?.(`Transcribing with whisper.cpp (${model}) …`);
+  // Report the file actually loaded, not the requested name — with
+  // WHISPER_CPP_MODEL_PATH set they can differ, and naming the requested
+  // model there would misreport which weights produced the transcript.
+  onProgress?.(`Transcribing with whisper.cpp (${basename(modelPath)}) …`);
 
   try {
     await execFile(bin, buildWhisperCppArgs(audioPath, modelPath, outputBase, opts), {
@@ -304,8 +307,15 @@ export async function transcribeWithWhisperCpp(
       maxBuffer: 64 * 1024 * 1024,
     });
   } catch (e: unknown) {
+    // execFile's message is only "Command failed: <argv>" — the actual reason
+    // (bad model header, unreadable WAV, OOM) is on stderr, so surface its tail.
+    // Without this the warning names the command and explains nothing.
+    const stderr =
+      typeof (e as { stderr?: unknown }).stderr === 'string'
+        ? (e as { stderr: string }).stderr.trim().split('\n').slice(-6).join(' | ')
+        : '';
     const reason = e instanceof Error ? e.message : String(e);
-    throw new Error(`whisper.cpp failed: ${reason}`, { cause: e });
+    throw new Error(`whisper.cpp failed: ${reason}${stderr ? ` — ${stderr}` : ''}`, { cause: e });
   }
 
   const { readFile } = await import('node:fs/promises');
